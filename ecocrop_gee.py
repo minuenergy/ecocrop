@@ -149,7 +149,12 @@ def create_custom_crop_parameters(
     ropmn: float, ropmx: float,
     rmin: float, rmax: float,
     gmin: int = 90, gmax: int = 180,
-    ktmp: float = None
+    ktmp: float = None,
+    # Soil moisture parameters (m³/m³)
+    sm_min: float = None,
+    sm_opt1: float = None,
+    sm_opt2: float = None,
+    sm_max: float = None
 ) -> Dict:
     """
     Create custom crop parameters manually.
@@ -162,11 +167,15 @@ def create_custom_crop_parameters(
         rmin/rmax: Absolute precipitation range (mm/year)
         gmin/gmax: Growing season length (days)
         ktmp: Killing temperature (°C)
+        sm_min: Minimum soil moisture (wilting point, m³/m³)
+        sm_opt1: Lower optimal soil moisture (m³/m³)
+        sm_opt2: Upper optimal soil moisture (m³/m³)
+        sm_max: Maximum soil moisture (waterlogging point, m³/m³)
 
     Returns:
         Dictionary with crop parameters
     """
-    return {
+    params = {
         'name': name,
         'common_name': name,
         'TOPMN': topmn,
@@ -183,6 +192,43 @@ def create_custom_crop_parameters(
         'TEXT': '',
         'TEXTR': '',
     }
+
+    # Add soil moisture parameters if provided
+    if sm_min is not None:
+        params['SM_MIN'] = sm_min
+    if sm_opt1 is not None:
+        params['SM_OPT1'] = sm_opt1
+    if sm_opt2 is not None:
+        params['SM_OPT2'] = sm_opt2
+    if sm_max is not None:
+        params['SM_MAX'] = sm_max
+
+    return params
+
+
+# Predefined soil moisture thresholds for common crop types
+SOIL_MOISTURE_PRESETS = {
+    'rice': {'SM_MIN': 0.25, 'SM_OPT1': 0.35, 'SM_OPT2': 0.45, 'SM_MAX': 0.55},
+    'wheat': {'SM_MIN': 0.12, 'SM_OPT1': 0.20, 'SM_OPT2': 0.32, 'SM_MAX': 0.40},
+    'maize': {'SM_MIN': 0.15, 'SM_OPT1': 0.22, 'SM_OPT2': 0.35, 'SM_MAX': 0.42},
+    'soybean': {'SM_MIN': 0.15, 'SM_OPT1': 0.25, 'SM_OPT2': 0.38, 'SM_MAX': 0.45},
+    'potato': {'SM_MIN': 0.18, 'SM_OPT1': 0.25, 'SM_OPT2': 0.35, 'SM_MAX': 0.42},
+    'cotton': {'SM_MIN': 0.10, 'SM_OPT1': 0.18, 'SM_OPT2': 0.30, 'SM_MAX': 0.38},
+    'default': {'SM_MIN': 0.10, 'SM_OPT1': 0.20, 'SM_OPT2': 0.35, 'SM_MAX': 0.45},
+}
+
+
+def get_soil_moisture_preset(crop_type: str) -> Dict:
+    """
+    Get predefined soil moisture thresholds for common crop types.
+
+    Args:
+        crop_type: 'rice', 'wheat', 'maize', 'soybean', 'potato', 'cotton', or 'default'
+
+    Returns:
+        Dictionary with SM_MIN, SM_OPT1, SM_OPT2, SM_MAX values
+    """
+    return SOIL_MOISTURE_PRESETS.get(crop_type.lower(), SOIL_MOISTURE_PRESETS['default'])
 
 
 # =============================================================================
@@ -362,6 +408,144 @@ def fetch_worldclim_data(roi: ee.Geometry) -> ee.Image:
 
 
 # =============================================================================
+# FLDAS Data Fetching (NASA Land Data Assimilation System)
+# =============================================================================
+
+def fetch_fldas_data(
+    roi: ee.Geometry,
+    start_date: str,
+    end_date: str
+) -> ee.Image:
+    """
+    Fetch NASA FLDAS (Famine Early Warning Systems Network Land Data Assimilation System)
+    monthly data for comprehensive land surface analysis.
+
+    FLDAS provides: temperature, precipitation, soil moisture (multiple depths),
+    soil temperature, evapotranspiration, and more.
+
+    Available: 1982-01-01 to present (monthly)
+    Resolution: ~11km (0.1 degree)
+
+    Args:
+        roi: Region of interest
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+
+    Returns:
+        ee.Image with climate and soil variables (annual aggregates)
+    """
+    fldas = ee.ImageCollection('NASA/FLDAS/NOAH01/C/GL/M/V001') \
+        .filterDate(start_date, end_date) \
+        .filterBounds(roi)
+
+    # Temperature: Tair_f_tavg is in Kelvin
+    mean_temp = fldas.select('Tair_f_tavg').mean() \
+        .subtract(273.15).rename('mean_temp')
+    min_temp = fldas.select('Tair_f_tavg').min() \
+        .subtract(273.15).rename('min_temp')
+    max_temp = fldas.select('Tair_f_tavg').max() \
+        .subtract(273.15).rename('max_temp')
+
+    # Precipitation: Rainf_f_tavg is in kg/m²/s, convert to mm/year
+    # 1 kg/m²/s = 1 mm/s, multiply by seconds in the period
+    n_months = fldas.size()
+
+    def convert_precip_to_monthly_mm(img):
+        """Convert precipitation rate to monthly mm."""
+        date = ee.Date(img.get('system:time_start'))
+        days_in_month = date.advance(1, 'month').difference(date, 'day')
+        seconds_in_month = days_in_month.multiply(86400)
+        return img.select('Rainf_f_tavg').multiply(seconds_in_month)
+
+    total_precip = fldas.map(convert_precip_to_monthly_mm).sum().rename('total_precip')
+
+    # Soil Moisture (m³/m³) at different depths
+    soil_moisture_0_10 = fldas.select('SoilMoi00_10cm_tavg').mean().rename('soil_moisture_0_10cm')
+    soil_moisture_10_40 = fldas.select('SoilMoi10_40cm_tavg').mean().rename('soil_moisture_10_40cm')
+    soil_moisture_40_100 = fldas.select('SoilMoi40_100cm_tavg').mean().rename('soil_moisture_40_100cm')
+    soil_moisture_100_200 = fldas.select('SoilMoi100_200cm_tavg').mean().rename('soil_moisture_100_200cm')
+
+    # Soil Temperature (K -> °C)
+    soil_temp_0_10 = fldas.select('SoilTemp00_10cm_tavg').mean() \
+        .subtract(273.15).rename('soil_temp_0_10cm')
+
+    # Evapotranspiration (kg/m²/s -> mm/year)
+    def convert_evap_to_monthly_mm(img):
+        date = ee.Date(img.get('system:time_start'))
+        days_in_month = date.advance(1, 'month').difference(date, 'day')
+        seconds_in_month = days_in_month.multiply(86400)
+        return img.select('Evap_tavg').multiply(seconds_in_month)
+
+    total_evap = fldas.map(convert_evap_to_monthly_mm).sum().rename('total_evap')
+
+    # Combine all bands
+    result = mean_temp \
+        .addBands(min_temp) \
+        .addBands(max_temp) \
+        .addBands(total_precip) \
+        .addBands(soil_moisture_0_10) \
+        .addBands(soil_moisture_10_40) \
+        .addBands(soil_moisture_40_100) \
+        .addBands(soil_moisture_100_200) \
+        .addBands(soil_temp_0_10) \
+        .addBands(total_evap)
+
+    print(f"✓ Fetched FLDAS data: {start_date} to {end_date}")
+    print(f"  Includes: temperature, precipitation, soil moisture (4 depths), soil temperature, evapotranspiration")
+    return result
+
+
+def fetch_fldas_monthly(
+    roi: ee.Geometry,
+    start_date: str,
+    end_date: str
+) -> ee.ImageCollection:
+    """
+    Fetch FLDAS data as monthly ImageCollection for time-series analysis.
+
+    Args:
+        roi: Region of interest
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+
+    Returns:
+        ee.ImageCollection with monthly climate and soil data
+    """
+    fldas = ee.ImageCollection('NASA/FLDAS/NOAH01/C/GL/M/V001') \
+        .filterDate(start_date, end_date) \
+        .filterBounds(roi)
+
+    def process_monthly(img):
+        """Process each monthly image to standard units."""
+        date = ee.Date(img.get('system:time_start'))
+        days_in_month = date.advance(1, 'month').difference(date, 'day')
+        seconds_in_month = days_in_month.multiply(86400)
+
+        # Temperature (K -> °C)
+        temp_c = img.select('Tair_f_tavg').subtract(273.15).rename('temp_c')
+
+        # Precipitation (kg/m²/s -> mm/month)
+        precip_mm = img.select('Rainf_f_tavg').multiply(seconds_in_month).rename('precip_mm')
+
+        # Soil moisture (already m³/m³)
+        soil_moist = img.select('SoilMoi00_10cm_tavg').rename('soil_moisture')
+
+        # Soil temperature (K -> °C)
+        soil_temp = img.select('SoilTemp00_10cm_tavg').subtract(273.15).rename('soil_temp_c')
+
+        # Evapotranspiration (kg/m²/s -> mm/month)
+        evap_mm = img.select('Evap_tavg').multiply(seconds_in_month).rename('evap_mm')
+
+        return ee.Image.cat([temp_c, precip_mm, soil_moist, soil_temp, evap_mm]) \
+            .copyProperties(img, ['system:time_start'])
+
+    processed = fldas.map(process_monthly)
+
+    print(f"✓ Fetched FLDAS monthly collection: {start_date} to {end_date}")
+    return processed
+
+
+# =============================================================================
 # Suitability Score Calculation
 # =============================================================================
 
@@ -506,7 +690,273 @@ def calculate_overall_suitability_gee(
 
 
 # =============================================================================
-# Soil Suitability (Optional)
+# Soil Moisture Suitability (FLDAS-specific)
+# =============================================================================
+
+def trapezoid_membership(
+    image: ee.Image,
+    a: float, b: float, c: float, d: float
+) -> ee.Image:
+    """
+    Calculate trapezoid membership function (0-1).
+
+    Score profile:
+        0 for x < a
+        Linear increase from 0 to 1 for a <= x < b
+        1 for b <= x <= c (optimal range)
+        Linear decrease from 1 to 0 for c < x <= d
+        0 for x > d
+
+    Args:
+        image: Input image
+        a: Lower limit (score = 0)
+        b: Lower optimal (score = 1)
+        c: Upper optimal (score = 1)
+        d: Upper limit (score = 0)
+
+    Returns:
+        ee.Image with membership scores (0-1)
+    """
+    x = ee.Image(image)
+
+    # Calculate scores for each region
+    # Rising edge: (x - a) / (b - a)
+    rising = x.subtract(a).divide(b - a)
+    # Falling edge: (d - x) / (d - c)
+    falling = ee.Image.constant(d).subtract(x).divide(d - c)
+
+    # Combine with conditions
+    score = ee.Image.constant(0) \
+        .where(x.gte(a).And(x.lt(b)), rising) \
+        .where(x.gte(b).And(x.lte(c)), 1) \
+        .where(x.gt(c).And(x.lte(d)), falling) \
+        .where(x.lt(a).Or(x.gt(d)), 0)
+
+    return score.clamp(0, 1)
+
+
+def calculate_soil_moisture_score_gee(
+    climate_image: ee.Image,
+    crop_params: Dict,
+    soil_moisture_band: str = 'soil_moisture_0_10cm'
+) -> ee.Image:
+    """
+    Calculate soil moisture suitability score using trapezoid membership.
+
+    Uses crop-specific soil moisture thresholds if provided,
+    otherwise uses default values based on general crop requirements.
+
+    Args:
+        climate_image: Image with soil moisture band (m³/m³)
+        crop_params: Crop parameters with optional SM_* thresholds
+        soil_moisture_band: Name of soil moisture band to use
+
+    Returns:
+        ee.Image with soil moisture score (0-100)
+    """
+    # Get soil moisture thresholds from crop params, or use defaults
+    # Default values are typical for most crops
+    sm_min = crop_params.get('SM_MIN', 0.10)    # Wilting point
+    sm_opt1 = crop_params.get('SM_OPT1', 0.20)  # Lower optimal
+    sm_opt2 = crop_params.get('SM_OPT2', 0.35)  # Upper optimal
+    sm_max = crop_params.get('SM_MAX', 0.45)    # Saturation/waterlogging
+
+    soil_moisture = climate_image.select(soil_moisture_band)
+
+    score = trapezoid_membership(soil_moisture, sm_min, sm_opt1, sm_opt2, sm_max)
+    score = score.multiply(100).rename('soil_moisture_score')
+
+    return score
+
+
+def calculate_fldas_suitability_gee(
+    climate_image: ee.Image,
+    crop_params: Dict,
+    method: str = 'annual',
+    weights: Dict = None
+) -> ee.Image:
+    """
+    Calculate comprehensive crop suitability using FLDAS data.
+
+    Includes temperature, precipitation, and soil moisture scores.
+
+    Args:
+        climate_image: FLDAS image with all required bands
+        crop_params: Crop parameters dictionary
+        method: 'annual' or 'perennial'
+        weights: Optional dict with 'temp', 'precip', 'soil_moisture' weights
+                 (default: equal weighting with minimum)
+
+    Returns:
+        ee.Image with all suitability scores
+    """
+    temp_score = calculate_temperature_score_gee(climate_image, crop_params, method)
+    precip_score = calculate_precipitation_score_gee(climate_image, crop_params)
+
+    # Check if soil moisture bands are available
+    band_names = climate_image.bandNames().getInfo()
+    has_soil_moisture = 'soil_moisture_0_10cm' in band_names
+
+    if has_soil_moisture:
+        sm_score = calculate_soil_moisture_score_gee(climate_image, crop_params)
+
+        if weights:
+            # Weighted average
+            w_t = weights.get('temp', 0.4)
+            w_p = weights.get('precip', 0.3)
+            w_sm = weights.get('soil_moisture', 0.3)
+
+            overall_score = temp_score.multiply(w_t) \
+                .add(precip_score.multiply(w_p)) \
+                .add(sm_score.multiply(w_sm)) \
+                .rename('overall_score')
+        else:
+            # Limiting factor (minimum)
+            overall_score = temp_score.min(precip_score).min(sm_score).rename('overall_score')
+
+        result = overall_score.addBands(temp_score).addBands(precip_score).addBands(sm_score)
+    else:
+        overall_score = temp_score.min(precip_score).rename('overall_score')
+        result = overall_score.addBands(temp_score).addBands(precip_score)
+
+    return result
+
+
+# =============================================================================
+# Monthly/Seasonal Suitability Analysis
+# =============================================================================
+
+def calculate_monthly_suitability(
+    monthly_collection: ee.ImageCollection,
+    crop_params: Dict,
+    weights: Dict = None
+) -> ee.ImageCollection:
+    """
+    Calculate monthly suitability scores from FLDAS monthly collection.
+
+    Args:
+        monthly_collection: FLDAS monthly ImageCollection (from fetch_fldas_monthly)
+        crop_params: Crop parameters dictionary
+        weights: Optional weights for each factor
+
+    Returns:
+        ee.ImageCollection with monthly suitability scores
+    """
+    # Extract crop parameters
+    topmn = crop_params['TOPMN']
+    topmx = crop_params['TOPMX']
+    tmin = crop_params['TMIN']
+    tmax = crop_params['TMAX']
+
+    # Monthly precipitation thresholds (convert annual to monthly)
+    ropmn_monthly = crop_params['ROPMN'] / 12
+    ropmx_monthly = crop_params['ROPMX'] / 12
+    rmin_monthly = crop_params['RMIN'] / 12
+    rmax_monthly = crop_params['RMAX'] / 12
+
+    # Soil moisture thresholds
+    sm_min = crop_params.get('SM_MIN', 0.10)
+    sm_opt1 = crop_params.get('SM_OPT1', 0.20)
+    sm_opt2 = crop_params.get('SM_OPT2', 0.35)
+    sm_max = crop_params.get('SM_MAX', 0.45)
+
+    # Weights
+    w_t = weights.get('temp', 0.4) if weights else 0.4
+    w_p = weights.get('precip', 0.3) if weights else 0.3
+    w_sm = weights.get('soil_moisture', 0.3) if weights else 0.3
+
+    def score_monthly(img):
+        """Calculate suitability for a single month."""
+        temp = img.select('temp_c')
+        precip = img.select('precip_mm')
+        soil_moist = img.select('soil_moisture')
+
+        # Temperature score
+        temp_score = trapezoid_membership(temp, tmin, topmn, topmx, tmax) \
+            .multiply(100).rename('temp_score')
+
+        # Precipitation score (monthly basis)
+        precip_score = trapezoid_membership(
+            precip, rmin_monthly, ropmn_monthly, ropmx_monthly, rmax_monthly
+        ).multiply(100).rename('precip_score')
+
+        # Soil moisture score
+        sm_score = trapezoid_membership(soil_moist, sm_min, sm_opt1, sm_opt2, sm_max) \
+            .multiply(100).rename('soil_moisture_score')
+
+        # Overall score (weighted average)
+        overall = temp_score.multiply(w_t) \
+            .add(precip_score.multiply(w_p)) \
+            .add(sm_score.multiply(w_sm)) \
+            .rename('overall_score')
+
+        return ee.Image.cat([overall, temp_score, precip_score, sm_score]) \
+            .copyProperties(img, ['system:time_start'])
+
+    return monthly_collection.map(score_monthly)
+
+
+def calculate_seasonal_suitability(
+    monthly_scores: ee.ImageCollection,
+    start_month: int,
+    end_month: int,
+    aggregation: str = 'mean'
+) -> ee.Image:
+    """
+    Aggregate monthly scores to seasonal/growing season score.
+
+    Args:
+        monthly_scores: ImageCollection with monthly suitability scores
+        start_month: Growing season start month (1-12)
+        end_month: Growing season end month (1-12)
+        aggregation: 'mean', 'min', or 'product'
+
+    Returns:
+        ee.Image with seasonal suitability score
+    """
+    # Filter to growing season months
+    def get_month(img):
+        date = ee.Date(img.get('system:time_start'))
+        return img.set('month', date.get('month'))
+
+    with_month = monthly_scores.map(get_month)
+
+    if start_month <= end_month:
+        # Normal season (e.g., April to October)
+        season = with_month.filter(
+            ee.Filter.And(
+                ee.Filter.gte('month', start_month),
+                ee.Filter.lte('month', end_month)
+            )
+        )
+    else:
+        # Cross-year season (e.g., October to March)
+        season = with_month.filter(
+            ee.Filter.Or(
+                ee.Filter.gte('month', start_month),
+                ee.Filter.lte('month', end_month)
+            )
+        )
+
+    # Aggregate
+    if aggregation == 'min':
+        result = season.select('overall_score').min().rename('seasonal_score')
+    elif aggregation == 'product':
+        # Geometric mean approximation
+        result = season.select('overall_score').reduce(ee.Reducer.mean()).rename('seasonal_score')
+    else:  # mean
+        result = season.select('overall_score').mean().rename('seasonal_score')
+
+    # Add component scores
+    temp_seasonal = season.select('temp_score').mean().rename('seasonal_temp_score')
+    precip_seasonal = season.select('precip_score').mean().rename('seasonal_precip_score')
+    sm_seasonal = season.select('soil_moisture_score').mean().rename('seasonal_sm_score')
+
+    return result.addBands(temp_seasonal).addBands(precip_seasonal).addBands(sm_seasonal)
+
+
+# =============================================================================
+# Soil Texture Suitability (Optional)
 # =============================================================================
 
 def fetch_soil_texture_gee(roi: ee.Geometry) -> ee.Image:
@@ -813,10 +1263,12 @@ class EcoCropGEE:
         Args:
             start_date: Start date (YYYY-MM-DD)
             end_date: End date (YYYY-MM-DD)
-            source: 'era5', 'terraclimate', or 'worldclim'
+            source: 'era5', 'terraclimate', 'worldclim', or 'fldas'
         """
         if self.roi is None:
             raise ValueError("Set ROI first using set_roi_* methods")
+
+        self.climate_source = source
 
         if source == 'worldclim':
             self.climate_data = fetch_worldclim_data(self.roi)
@@ -824,6 +1276,12 @@ class EcoCropGEE:
             if not start_date or not end_date:
                 raise ValueError("start_date and end_date required for TerraClimate")
             self.climate_data = fetch_terraclimate_data(self.roi, start_date, end_date)
+        elif source == 'fldas':
+            if not start_date or not end_date:
+                raise ValueError("start_date and end_date required for FLDAS")
+            self.climate_data = fetch_fldas_data(self.roi, start_date, end_date)
+            self.start_date = start_date
+            self.end_date = end_date
         else:  # era5
             if not start_date or not end_date:
                 raise ValueError("start_date and end_date required for ERA5")
@@ -831,26 +1289,146 @@ class EcoCropGEE:
 
         return self
 
-    def calculate_suitability(self, method: str = 'annual'):
+    def fetch_fldas_monthly(self, start_date: str, end_date: str):
+        """
+        Fetch FLDAS monthly data for time-series analysis.
+
+        Args:
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+        """
+        if self.roi is None:
+            raise ValueError("Set ROI first using set_roi_* methods")
+
+        self.fldas_monthly = fetch_fldas_monthly(self.roi, start_date, end_date)
+        self.start_date = start_date
+        self.end_date = end_date
+        return self
+
+    def calculate_suitability(self, method: str = 'annual', weights: Dict = None):
         """
         Calculate crop suitability scores.
 
         Args:
             method: 'annual' or 'perennial'
+            weights: Optional dict with 'temp', 'precip', 'soil_moisture' weights
+                     (only used with FLDAS data)
         """
         if self.climate_data is None:
             raise ValueError("Fetch climate data first")
         if self.crop_params is None:
             raise ValueError("Set crop first")
 
-        self.scores = calculate_overall_suitability_gee(
-            self.climate_data,
-            self.crop_params,
-            method
-        )
+        # Use FLDAS-specific calculation if source is FLDAS (includes soil moisture)
+        if hasattr(self, 'climate_source') and self.climate_source == 'fldas':
+            self.scores = calculate_fldas_suitability_gee(
+                self.climate_data,
+                self.crop_params,
+                method,
+                weights
+            )
+            print(f"✓ Calculated suitability scores for {self.crop_params['name']} (with soil moisture)")
+        else:
+            self.scores = calculate_overall_suitability_gee(
+                self.climate_data,
+                self.crop_params,
+                method
+            )
+            print(f"✓ Calculated suitability scores for {self.crop_params['name']}")
 
-        print(f"✓ Calculated suitability scores for {self.crop_params['name']}")
         return self
+
+    def calculate_monthly_scores(self, weights: Dict = None):
+        """
+        Calculate monthly suitability scores using FLDAS data.
+
+        Args:
+            weights: Optional dict with 'temp', 'precip', 'soil_moisture' weights
+
+        Returns:
+            self (with monthly_scores attribute set)
+        """
+        if not hasattr(self, 'fldas_monthly'):
+            raise ValueError("Fetch FLDAS monthly data first using fetch_fldas_monthly()")
+        if self.crop_params is None:
+            raise ValueError("Set crop first")
+
+        self.monthly_scores = calculate_monthly_suitability(
+            self.fldas_monthly,
+            self.crop_params,
+            weights
+        )
+        print(f"✓ Calculated monthly suitability scores for {self.crop_params['name']}")
+        return self
+
+    def calculate_seasonal_score(
+        self,
+        start_month: int,
+        end_month: int,
+        aggregation: str = 'mean'
+    ):
+        """
+        Calculate growing season suitability score.
+
+        Args:
+            start_month: Growing season start month (1-12)
+            end_month: Growing season end month (1-12)
+            aggregation: 'mean', 'min', or 'product'
+
+        Returns:
+            self (with seasonal_scores attribute set)
+        """
+        if not hasattr(self, 'monthly_scores'):
+            raise ValueError("Calculate monthly scores first using calculate_monthly_scores()")
+
+        self.seasonal_scores = calculate_seasonal_suitability(
+            self.monthly_scores,
+            start_month,
+            end_month,
+            aggregation
+        )
+        print(f"✓ Calculated seasonal score (months {start_month}-{end_month})")
+        return self
+
+    def get_monthly_timeseries(self, scale: int = 10000) -> pd.DataFrame:
+        """
+        Get monthly suitability time series as DataFrame.
+
+        Args:
+            scale: Resolution in meters for reduction
+
+        Returns:
+            DataFrame with monthly scores
+        """
+        if not hasattr(self, 'monthly_scores'):
+            raise ValueError("Calculate monthly scores first")
+
+        # Reduce each image to mean over ROI
+        def extract_values(img):
+            date = ee.Date(img.get('system:time_start'))
+            values = img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=self.roi,
+                scale=scale,
+                maxPixels=1e9
+            )
+            return ee.Feature(None, values).set('date', date.format('YYYY-MM'))
+
+        features = self.monthly_scores.map(extract_values)
+        fc = ee.FeatureCollection(features)
+
+        # Get as list and convert to DataFrame
+        data = fc.getInfo()['features']
+        records = []
+        for f in data:
+            props = f['properties']
+            records.append(props)
+
+        df = pd.DataFrame(records)
+        if 'date' in df.columns:
+            df = df.set_index('date')
+
+        return df
 
     def get_statistics(self, scale: int = 1000) -> Dict:
         """Get regional statistics."""
